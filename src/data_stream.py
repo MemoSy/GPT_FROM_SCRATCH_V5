@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -12,6 +13,7 @@ class FineWebPackedStream:
         self,
         *,
         tokenizer_path: str = "tokenizer",
+        data_dir: str = "data/fineweb_edu_10BT/sample/10BT",
         block_size: int = 2048,
         min_chars: int = 300,
         max_chars: int = 50_000,
@@ -27,6 +29,7 @@ class FineWebPackedStream:
         self.min_int_score = min_int_score
         self.shuffle_buffer = shuffle_buffer
         self.seed = seed
+        self.epoch = 0
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             tokenizer_path,
@@ -45,9 +48,23 @@ class FineWebPackedStream:
 
         self.eos_id = self.tokenizer.eos_token_id
 
+        root = Path(data_dir).resolve()
+        files = sorted(root.glob("*.parquet"))
+
+        if len(files) != 14:
+            raise RuntimeError(
+                f"Expected 14 local FineWeb-Edu shards, found {len(files)} in {root}"
+            )
+
+        self.data_files = [str(f) for f in files]
+
+        print(f"data source: LOCAL ONLY")
+        print(f"local shards: {len(files)}")
+        print(f"data directory: {root}")
+
         self.dataset = load_dataset(
-            "HuggingFaceFW/fineweb-edu",
-            name="sample-10BT",
+            "parquet",
+            data_files={"train": self.data_files},
             split="train",
             streaming=True,
         )
@@ -83,15 +100,13 @@ class FineWebPackedStream:
         score = example.get("score")
         int_score = example.get("int_score")
 
-        if score is not None:
-            if float(score) < self.min_score:
-                self.rejected_docs += 1
-                return None
+        if score is not None and float(score) < self.min_score:
+            self.rejected_docs += 1
+            return None
 
-        if int_score is not None:
-            if int(int_score) < self.min_int_score:
-                self.rejected_docs += 1
-                return None
+        if int_score is not None and int(int_score) < self.min_int_score:
+            self.rejected_docs += 1
+            return None
 
         return text[: self.max_chars]
 
@@ -100,7 +115,21 @@ class FineWebPackedStream:
 
     def __next__(self) -> torch.Tensor:
         while len(self.buffer) < self.block_size:
-            example = next(self.iterator)
+            try:
+                example = next(self.iterator)
+            except StopIteration:
+                self.epoch += 1
+
+                # Hugging Face reshuffles using effective seed:
+                # initial seed + epoch.
+                self.dataset.set_epoch(self.epoch)
+                self.iterator = iter(self.dataset)
+
+                print(
+                    f"data epoch rollover -> {self.epoch}",
+                    flush=True,
+                )
+                continue
 
             text = self._accept_text(example)
 
@@ -118,7 +147,6 @@ class FineWebPackedStream:
 
             self.buffer.extend(ids)
             self.buffer.append(self.eos_id)
-
             self.accepted_docs += 1
 
         block = self.buffer[: self.block_size]
@@ -139,6 +167,7 @@ class FineWebPackedStream:
     def state_dict(self) -> dict[str, Any]:
         return {
             "dataset": self.dataset.state_dict(),
+            "epoch": self.epoch,
             "buffer": self.buffer.copy(),
             "accepted_docs": self.accepted_docs,
             "rejected_docs": self.rejected_docs,
@@ -147,6 +176,7 @@ class FineWebPackedStream:
             "block_size": self.block_size,
             "seed": self.seed,
             "shuffle_buffer": self.shuffle_buffer,
+            "source": "local_fineweb_edu_10BT",
         }
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -159,9 +189,13 @@ class FineWebPackedStream:
         if state["shuffle_buffer"] != self.shuffle_buffer:
             raise ValueError("shuffle_buffer mismatch")
 
+        # Old checkpoints (including step 7500) don't have this field,
+        # so they correctly resume as epoch 0.
+        dataset_epoch = state.get("dataset", {}).get("epoch", 0)
+        self.epoch = int(state.get("epoch", dataset_epoch))
+
         self.dataset.load_state_dict(state["dataset"])
 
-        # Recreate iterator AFTER restoring dataset state.
         self.iterator = iter(self.dataset)
 
         self.buffer = list(state["buffer"])
